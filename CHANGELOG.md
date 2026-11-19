@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.11 (2026-11-17)
+
+Rules and documentation (audit unchanged, version 1.3.2)
+- `RULES.md`: the continuation check of the Dec 7 procedure runs with `--end 2026-12-06T23:00`, the
+  last bar the period should have (`--end 2026-10-18T14:00` on Nov 22). Before, the check took the
+  last bar most symbols have as the end, so a period cut short for every symbol passed without a
+  word, and one cut short for most of them made the complete symbols look wrong.
+- `src/contrib/yousof.py` (Track 01): `--end` and `end=` in `check_continuation`. A symbol cut short
+  at the end of the panel is now a warning that names its missing hours, as the audit runs on such a
+  file; before, it was an error.
+
+## v1.10 (2026-11-17)
+
+Rules and documentation (audit unchanged, version 1.3.2)
+- `RULES.md`, the Dec 7 procedure has a new step 2. It checks that the forward period continues the
+  panel with `python -m src.contrib.yousof --continuation` (Track 01, #34) and lists the first bar,
+  the last bar and the number of bars of every symbol in both files. If anything is off, both files
+  are built again once with `--overwrite`. Missing hours that remain are listed in the report, and
+  the run goes ahead on the bars that exist.
+- If an hour is missing for every symbol at the seam, or the period file starts late, the audit
+  cannot run, because it stops on such a seam. The seam then moves to the hour after the first full
+  hour past the gap. The missing hours fall inside the panel, and the forward period is shorter by
+  those hours.
+- The check's output and the bar list are published with the log. On Nov 22 the same check runs on
+  the train and holdout files.
+- A strategy that fails on a missing hour or on a filled bar (zero volume, zero funding) is listed as
+  failed, like any other failure in an official run.
+
+## v1.9 (2026-11-15)
+
+Rules and documentation (audit unchanged, version 1.3.2)
+- `RULES.md`: new section "Extra strategies". A participant may open one strategy PR outside their
+  track, by Nov 20. It is merged before the freeze once their own Part 1 is merged and Part 2 is open,
+  and it is reported as exploratory unless its hypothesis and settings were posted before the first
+  full-panel run. Nothing changes for track PRs or for strategies already merged.
+
 ## v1.8 (2026-11-08)
 
 Audit (audit version 1.3.2). Reported privately by Yousof.

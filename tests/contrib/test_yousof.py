@@ -14,7 +14,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.audit import _sha256, holdout_start_problem
+from data.build_dataset import generate_calibrated_panel
+from src.audit import (
+    AUDIT_VERSION,
+    _sha256,
+    format_audit_report,
+    holdout_start_problem,
+    run_full_audit,
+)
 from src.contrib.yousof import (
     CHECKED_VERSIONS,
     DQS_MIN,
@@ -26,7 +33,7 @@ from src.contrib.yousof import (
     parse_audit_report,
     split_reports,
 )
-from src.quality import audit_dataset
+from src.quality import audit_dataset, autoclean_market_data
 
 TRAIN = Path("data/train_1h.parquet")
 HOUR = pd.Timedelta(hours=1)
@@ -155,7 +162,7 @@ def test_dropped_hour_is_reported(split: Split) -> None:
     sym, hour = _sym(new), _hour(new, 100)
     dropped = (new["symbol"] == sym) & (new["timestamp"] == hour)
     assert check_continuation(prev, new.loc[~dropped]) == [
-        f"error: {sym}: no bar at {_fmt(hour)} UTC (1 missing)"
+        f"warning: {sym}: no bar at {_fmt(hour)} UTC (1 missing)"
     ]
 
 
@@ -180,14 +187,15 @@ def test_symbol_shifted_by_one_hour_is_reported(split: Split) -> None:
 
     problems = check_continuation(prev, shifted)
     assert _errors(problems) == [
-        f"error: {sym}: new starts at {_fmt(start + HOUR)} UTC, expected "
-        f"{_fmt(start)}, one hour after prev ends",
         f"error: {sym}: new ends at {_fmt(end + HOUR)} UTC, most symbols "
-        f"end at {_fmt(end)}",
+        f"end at {_fmt(end)}"
     ]
-    # The shift also moves the symbol's funding off the settlement
-    # hours.
-    assert any(sym in w and OFF_HOURS in w for w in _warnings(problems))
+    # Its first hour is missing, and the shift moves its funding off
+    # the settlement hours.
+    warnings = _warnings(problems)
+    missing = f"warning: {sym}: no bar at {_fmt(start)} UTC (1 missing)"
+    assert warnings[0] == missing
+    assert any(sym in w and OFF_HOURS in w for w in warnings)
 
 
 def test_funding_at_0500_is_a_warning_not_an_error(split: Split) -> None:
@@ -213,7 +221,7 @@ def test_whole_missing_hour_is_one_line(split: Split) -> None:
     n_sym = new["symbol"].nunique()
     problems = check_continuation(prev, new.loc[new["timestamp"] != hour])
     assert problems == [
-        f"error: all {n_sym} symbols: no bar at {_fmt(hour)} UTC "
+        f"warning: all {n_sym} symbols: no bar at {_fmt(hour)} UTC "
         "(1 missing)"
     ]
 
@@ -250,8 +258,8 @@ def test_symbols_ending_early_are_reported(
     end = new["timestamp"].max()
     cut_short = new["symbol"].isin(syms) & (new["timestamp"] == end)
     assert check_continuation(prev, new.loc[~cut_short]) == [
-        f"error: {', '.join(syms)}: new ends at {_fmt(end - HOUR)} UTC, "
-        f"most symbols end at {_fmt(end)}"
+        f"warning: {', '.join(syms)}: no bar at {_fmt(end)} UTC "
+        "(1 missing)"
     ]
 
 
@@ -263,12 +271,85 @@ def test_existing_checks_pass_a_symbol_short_at_either_end(
     # missing its first or its last bar, the file-level start check
     # and the data quality gate of the audit both pass the file.
     prev, new = split
-    hour = new["timestamp"].agg(edge)
-    cut = (new["symbol"] == _sym(new)) & (new["timestamp"] == hour)
+    sym, hour = _sym(new), new["timestamp"].agg(edge)
+    cut = (new["symbol"] == sym) & (new["timestamp"] == hour)
     broken = new.loc[~cut]
     assert holdout_start_problem(prev, broken) is None
     assert audit_dataset(broken).dqs >= DQS_MIN
-    assert len(_errors(check_continuation(prev, broken))) == 1
+    assert check_continuation(prev, broken) == [
+        f"warning: {sym}: no bar at {_fmt(hour)} UTC (1 missing)"
+    ]
+
+
+def test_symbol_cut_short_in_prev_is_a_warning(split: Split) -> None:
+    # The audit compares the start of the file with the end of the
+    # whole panel, so it runs on this; the missing hours are named.
+    prev, new = split
+    sym = _sym(new)
+    last = prev["timestamp"].max()
+    tail = (prev["symbol"] == sym) & (prev["timestamp"] > last - 6 * HOUR)
+    short = prev.loc[~tail]
+    assert holdout_start_problem(short, new) is None
+    assert check_continuation(short, new) == [
+        f"warning: {sym}: no bar from {_fmt(last - 5 * HOUR)} to "
+        f"{_fmt(last)} UTC (6 missing)"
+    ]
+
+
+def test_without_end_a_file_short_everywhere_looks_complete(
+    split: Split,
+) -> None:
+    # Why --end exists: the last bar most symbols have is the end.
+    prev, new = split
+    end = new["timestamp"].max()
+    assert check_continuation(prev, new.loc[new["timestamp"] != end]) == []
+
+
+def test_with_end_a_file_short_everywhere_is_a_warning(split: Split) -> None:
+    prev, new = split
+    end = new["timestamp"].max()
+    n_sym = new["symbol"].nunique()
+    short = new.loc[new["timestamp"] < end - HOUR]
+    assert check_continuation(prev, short, end=end) == [
+        f"warning: all {n_sym} symbols: no bar from {_fmt(end - HOUR)} to "
+        f"{_fmt(end)} UTC (2 missing)"
+    ]
+    assert check_continuation(prev, new, end=end) == []
+
+
+def test_with_end_most_symbols_short_blames_only_those(split: Split) -> None:
+    # Without end, 11 of 20 short make the 9 complete ones the error.
+    prev, new = split
+    syms = sorted(new["symbol"].unique())[:11]
+    end = new["timestamp"].max()
+    cut_short = new["symbol"].isin(syms) & (new["timestamp"] == end)
+    broken = new.loc[~cut_short]
+    assert _errors(check_continuation(prev, broken)) != []
+    assert check_continuation(prev, broken, end=end) == [
+        f"warning: {', '.join(syms)}: no bar at {_fmt(end)} UTC "
+        "(1 missing)"
+    ]
+
+
+def test_with_end_a_bar_after_it_is_an_error(split: Split) -> None:
+    prev, new = split
+    sym = _sym(new)
+    shifted = new.copy()
+    mask = shifted["symbol"] == sym
+    shifted.loc[mask, "timestamp"] = shifted.loc[mask, "timestamp"] + HOUR
+    end = new["timestamp"].max()
+    assert _errors(check_continuation(prev, shifted, end=end)) == [
+        f"error: {sym}: new ends at {_fmt(end + HOUR)} UTC, after the "
+        f"expected end {_fmt(end)}"
+    ]
+
+
+def test_end_that_cannot_be_read_is_an_error(split: Split) -> None:
+    prev, new = split
+    assert check_continuation(prev, new, end="not a time") == [
+        "error: end is not a time, so the end of new was compared with "
+        "the other symbols instead"
+    ]
 
 
 def test_missing_and_extra_symbols_are_reported(split: Split) -> None:
@@ -331,7 +412,7 @@ def test_rows_without_a_key_are_reported(split: Split, key: str) -> None:
     broken.loc[row, key] = None
     assert check_continuation(prev, broken) == [
         "error: 1 rows in new have no timestamp or no symbol",
-        f"error: {sym}: no bar at {_fmt(hour)} UTC (1 missing)",
+        f"warning: {sym}: no bar at {_fmt(hour)} UTC (1 missing)",
     ]
 
 
@@ -391,11 +472,110 @@ def test_price_jump_at_the_seam_is_a_warning(split: Split) -> None:
 
 def test_errors_come_before_warnings(split: Split) -> None:
     prev, new = split
-    broken = new.loc[new["timestamp"] != _hour(new, 50)].copy()
+    broken = pd.concat([new, new.iloc[[500]]], ignore_index=True)
     broken.loc[broken["symbol"] == _sym(new), "funding_rate"] = 0.0
     problems = check_continuation(prev, broken)
     kinds = [line.split(":")[0] for line in problems]
     assert kinds == ["error", "warning"]
+
+
+def test_bars_the_builder_filled_in_are_a_warning(split: Split) -> None:
+    # The builder fills a gap of up to three hours with bars of zero
+    # volume. The file then has every hour again, and only this
+    # warning shows that two of its bars were never traded.
+    prev, new = split
+    sym = _sym(new)
+    hours = [_hour(new, 100), _hour(new, 101)]
+    gap = (new["symbol"] == sym) & new["timestamp"].isin(hours)
+    built = autoclean_market_data(new.loc[~gap])
+    assert check_continuation(prev, built) == [
+        "warning: 2 bars in new have zero volume, as when the builder "
+        f"fills a short gap: {sym} at {_fmt(hours[0])}, {_fmt(hours[1])}"
+    ]
+
+
+def test_gap_longer_than_the_builder_fills_is_a_warning(
+    split: Split,
+) -> None:
+    # Six hours: the builder fills three and drops three. No error: a
+    # gap on the exchange's side is still there after a second
+    # download, and the run goes ahead on the bars that exist.
+    prev, new = split
+    sym = _sym(new)
+    hours = [_fmt(_hour(new, 100 + i)) for i in range(6)]
+    gap = (new["symbol"] == sym) & new["timestamp"].isin(
+        [_hour(new, 100 + i) for i in range(6)]
+    )
+    built = autoclean_market_data(new.loc[~gap])
+    assert check_continuation(prev, built) == [
+        f"warning: {sym}: no bar from {hours[3]} to {hours[5]} UTC "
+        "(3 missing)",
+        "warning: 3 bars in new have zero volume, as when the builder "
+        f"fills a short gap: {sym} at {', '.join(hours[:3])}",
+    ]
+
+
+def test_every_missing_hour_is_named_as_periods(split: Split) -> None:
+    # Eight hours in a row, then one alone. The report of a run lists
+    # the gap, so no hour is left out of the line, and hours in a
+    # row are one period.
+    prev, new = split
+    sym = _sym(new)
+    hours = [_hour(new, 100 + i) for i in range(8)] + [_hour(new, 120)]
+    gap = (new["symbol"] == sym) & new["timestamp"].isin(hours)
+    assert check_continuation(prev, new.loc[~gap]) == [
+        f"warning: {sym}: no bar from {_fmt(hours[0])} to "
+        f"{_fmt(hours[7])}, at {_fmt(hours[8])} UTC (9 missing)"
+    ]
+
+
+def test_continuation_from_the_command_line(
+    split: Split, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prev, new = split
+    prev_file, new_file = tmp_path / "prev.pq", tmp_path / "new.pq"
+    prev.tail(2 * 24 * new["symbol"].nunique()).to_parquet(prev_file)
+    new.to_parquet(new_file)
+    args = ["--continuation", str(prev_file), str(new_file)]
+    assert main(args) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"prev: {prev_file} (sha256 {file_hash(prev_file)})",
+        f"new: {new_file} (sha256 {file_hash(new_file)})",
+        "no problems",
+    ]
+    # A warning alone is exit code 0, an error 1.
+    sym, hour = _sym(new), _hour(new, 100)
+    gap_file = tmp_path / "gap.pq"
+    dropped = (new["symbol"] == sym) & (new["timestamp"] == hour)
+    new.loc[~dropped].to_parquet(gap_file)
+    assert main(args[:2] + [str(gap_file)]) == 0
+    assert capsys.readouterr().out.splitlines()[2:] == [
+        f"warning: {sym}: no bar at {_fmt(hour)} UTC (1 missing)"
+    ]
+    # With --end, a file short for every symbol is a warning, exit 0.
+    end = new["timestamp"].max()
+    short_file = tmp_path / "short.pq"
+    new.loc[new["timestamp"] != end].to_parquet(short_file)
+    assert main(args[:2] + [str(short_file), "--end", str(end)]) == 0
+    assert capsys.readouterr().out.splitlines()[2:] == [
+        f"warning: all {new['symbol'].nunique()} symbols: no bar at "
+        f"{_fmt(end)} UTC (1 missing)"
+    ]
+    downloaded = str(new["timestamp"].max() + HOUR / 2)
+    assert main(args + ["--as-of", downloaded]) == 1
+    assert "had not closed at download time" in capsys.readouterr().out
+    # A file that cannot be read is exit code 2, and so is a call that
+    # mixes the check with reports.
+    assert main(args[:2] + [str(tmp_path / "gone.pq")]) == 2
+    assert capsys.readouterr().out.startswith("Could not read ")
+    for wrong in (
+        args + ["report.txt"],
+        ["--as-of", downloaded],
+        ["--end", downloaded],
+    ):
+        with pytest.raises(SystemExit) as stop:
+            main(wrong)
+        assert stop.value.code == 2
 
 
 # --- Part 2: the audit report as a table -----------------------------
@@ -412,7 +592,8 @@ FORGING_SHA = "b95f1fc02841b1f2"
 WITHHELD_NOTE = (
     "not read, as they come below a strategy's error message, which "
     "before audit 1.3.2 could add lines of its own: lag test, null check, "
-    "wick share, fee table, 5 bps row, out-of-sample Sharpe"
+    "wick share, fee table, 5 bps row, out-of-sample Sharpe, PnL "
+    "breakdown, review flags"
 )
 VERSION_NOTE = (
     "audit v{} is not one this parser was checked against (1.0.0 to "
@@ -430,6 +611,12 @@ BASELINE = dict(
     lag1_sharpe=-1.53, lag2_sharpe=-1.53, lag_passed=True,
     null_mean=-0.0, null_sd=0.74, null_passed=True,
     wick_share_pct=2.2, wick_passed=True,
+    fee_sharpes=[
+        ("0.0 bps", -0.12), ("3.0 bps", -0.97), ("5.0 bps", -1.53),
+        ("10.0 bps", -2.95), ("tiered ~7.7", -2.29),
+    ],
+    gross_pnl_pct=-3.96, fee_cost_pct=38.80, funding_drag_pct=-0.77,
+    net_pnl_pct=-42.00, review_flags="none",
 )
 LEAKY = dict(
     strategy="leaky_example.py", version="1.3.1", commit="f9c2892",
@@ -444,6 +631,13 @@ LEAKY = dict(
     lag2_sharpe=-10.33, lag_passed=False, null_mean=-0.11,
     null_sd=0.83, null_passed=True, wick_share_pct=0.9,
     wick_passed=True,
+    fee_sharpes=[
+        ("0.0 bps", -0.19), ("3.0 bps", -5.60), ("5.0 bps", -9.21),
+        ("10.0 bps", -18.21), ("tiered ~7.7", -14.13),
+    ],
+    gross_pnl_pct=-21.12, fee_cost_pct=1014.79, funding_drag_pct=-0.21,
+    net_pnl_pct=-1035.70, baseline_corr=-0.05,
+    review_flags="negative shift or centered window (lines 20)",
 )
 EXPECTED: dict[str, dict] = {
     REJECT_REPORT: BASELINE,
@@ -474,6 +668,12 @@ EXPECTED: dict[str, dict] = {
         lag1_sharpe=2.85, lag2_sharpe=2.69, lag_passed=True,
         null_mean=0.28, null_sd=1.71, null_passed=True,
         wick_share_pct=2.4, wick_passed=True,
+        fee_sharpes=[
+            ("0.0 bps", 4.17), ("3.0 bps", 3.38), ("5.0 bps", 2.85),
+            ("10.0 bps", 1.53), ("tiered ~7.7", 2.12),
+        ],
+        gross_pnl_pct=23.16, fee_cost_pct=7.32, funding_drag_pct=0.07,
+        net_pnl_pct=15.78, review_flags="none",
     ),
     # Version 1.3.2 changed how error messages are printed, not the
     # numbers.
@@ -509,6 +709,12 @@ EXPECTED: dict[str, dict] = {
         oos_sharpe_ci=(math.nan, math.nan), lag1_sharpe=0.0,
         lag2_sharpe=0.0, lag_passed=False, null_mean=0.0, null_sd=0.0,
         null_passed=False, wick_share_pct=100.0, wick_passed=False,
+        fee_sharpes=[
+            ("0.0 bps", 0.0), ("3.0 bps", 0.0), ("5.0 bps", 0.0),
+            ("10.0 bps", 0.0),
+        ],
+        gross_pnl_pct=0.0, fee_cost_pct=0.0, funding_drag_pct=0.0,
+        net_pnl_pct=0.0, review_flags="none",
     ),
     # The audit stops before the report (exit code 2).
     "holdout_late_start_error.txt": dict(
@@ -531,6 +737,12 @@ EXPECTED: dict[str, dict] = {
         wick_share_pct=1.8, wick_passed=True, holdout_passed=True,
         holdout_sharpe=3.10, holdout_sharpe_ci=(-6.78, 13.09),
         holdout_detail="bar-by-bar evaluation",
+        fee_sharpes=[
+            ("0.0 bps", 2.96), ("3.0 bps", 2.05), ("5.0 bps", 1.45),
+            ("10.0 bps", -0.07), ("tiered ~7.7", 0.61),
+        ],
+        gross_pnl_pct=21.53, fee_cost_pct=11.08, funding_drag_pct=-0.12,
+        net_pnl_pct=10.56, review_flags="none",
     ),
     "crashing_example_v1.3.1.txt": dict(
         strategy="crashing_example.py", version="1.3.1", commit="f9c2892",
@@ -552,6 +764,12 @@ EXPECTED: dict[str, dict] = {
         dqs=99.93, sharpe_5bps=3.15, turnover_5bps=0.0504, oos_sharpe=4.19,
         lag1_sharpe=3.15, lag2_sharpe=3.14, lag_passed=True,
         wick_share_pct=2.4, wick_passed=True,
+        fee_sharpes=[
+            ("0.0 bps", 4.48), ("3.0 bps", 3.68), ("5.0 bps", 3.15),
+            ("10.0 bps", 1.83),
+        ],
+        gross_pnl_pct=29.42, fee_cost_pct=8.71, funding_drag_pct=-0.03,
+        net_pnl_pct=20.73,
         problems=[
             "missing: audit version (no 'audit v...' line); the report is "
             "older than audit 1.0.0 or its format changed",
@@ -646,6 +864,12 @@ def test_table_of_a_pass_with_holdout() -> None:
         "| Turnover @ 5 bps | pass | 0.0513 |",
         "| Holdout | pass | +3.10, 95% CI [-6.78, +13.09] includes 0, "
         "`bar-by-bar evaluation` |",
+        "| Sharpe by fee | | 0 bps +2.96, 3 bps +2.05, 5 bps +1.45, 10 bps "
+        "-0.07, tiered ~7.7 bps +0.61 |",
+        "| Break-even fee | | about 9.77 bps, interpolated between the 5 "
+        "and 10 bps rows |",
+        "| PnL @ 5 bps | | gross +21.53%, fee cost +11.08%, funding drag "
+        "-0.12%, net +10.56% |",
     ]
 
 
@@ -658,7 +882,8 @@ def test_table_of_a_reject_shows_the_failed_check() -> None:
         "-1.53 (needs > 0), 95% CI [-3.00, +0.07] includes 0",
     ]
     del rows["Verdict"], rows["Data"], rows["Sharpe @ 5 bps"]
-    assert [result for result, _ in rows.values()] == ["pass"] * 6
+    checks = [result for result, _ in rows.values() if result]
+    assert checks == ["pass"] * 6
     assert "Holdout" not in rows
     assert "verdict is" not in table and "Parser notes" not in table
 
@@ -778,7 +1003,7 @@ def test_error_message_in_the_holdout_line_before_1_3_2() -> None:
     assert summary.problems == [
         "not read, as they come below a strategy's error message, which "
         "before audit 1.3.2 could add lines of its own: lag test, null "
-        "check, wick share"
+        "check, wick share, PnL breakdown, review flags"
     ]
 
 
@@ -802,6 +1027,77 @@ def test_table_of_a_report_older_than_the_version_line() -> None:
     assert notes == [
         f"- `{p}`" for p in EXPECTED["baseline_flow_6ed3535.txt"]["problems"]
     ]
+
+
+def test_table_has_the_numbers_a_strategy_write_up_asks_for() -> None:
+    # Fee rows, break-even fee, PnL split and correlation with the
+    # baseline (Issues #4, #5, #7), and the review flags of block [13].
+    # They carry no result: none of them is part of the verdict.
+    rows = _rows(_table(_report("leaky_example_v1.3.1.txt")))
+    assert rows["Sharpe by fee"] == [
+        "",
+        "0 bps -0.19, 3 bps -5.60, 5 bps -9.21, 10 bps -18.21, tiered "
+        "~7.7 bps -14.13",
+    ]
+    assert rows["PnL @ 5 bps"] == [
+        "",
+        "gross -21.12%, fee cost +1014.79%, funding drag -0.21%, net "
+        "-1035.70%",
+    ]
+    assert rows["Correlation with baseline"] == [
+        "", "-0.05, hourly net returns at 5 bps"
+    ]
+    assert rows["Review flags"] == [
+        "",
+        "`negative shift or centered window (lines 20)` (manual review, "
+        "not part of the verdict)",
+    ]
+    # The baseline has no correlation with itself and no flags, and a
+    # run that crashed prints zeros: no such rows.
+    rows = _rows(_table(_report(REJECT_REPORT)))
+    assert "Correlation with baseline" not in rows
+    assert "Review flags" not in rows
+    rows = _rows(_table(_report("forging_example_v1.3.2.txt")))
+    assert "Sharpe by fee" not in rows and "PnL @ 5 bps" not in rows
+
+
+def test_break_even_fee_is_interpolated_from_the_fee_rows() -> None:
+    # The report prints no break-even fee. Between the two rows where
+    # the Sharpe changes sign it is read off a straight line, and the
+    # row says so; without a change of sign it is only a bound.
+    def break_even(text: str) -> str:
+        return _rows(_table(text))["Break-even fee"][1]
+
+    assert break_even(_report(PASS_REPORT)) == (
+        "about 9.77 bps, interpolated between the 5 and 10 bps rows"
+    )
+    assert break_even(_report("baseline_flow_low_dqs_v1.3.1.txt")) == (
+        "> 10 bps (Sharpe above 0 in every fee row)"
+    )
+    assert break_even(_report(REJECT_REPORT)) == (
+        "< 0 bps (Sharpe not above 0 at 0 bps)"
+    )
+    # The 0 and 3 bps rows of #9, where 0.39 bps was worked out by hand.
+    text = _report(REJECT_REPORT)
+    text = _edit(text, "0.0 bps      -0.12", "0.0 bps      +1.48")
+    text = _edit(text, "3.0 bps      -0.97", "3.0 bps      -9.93")
+    assert break_even(text) == (
+        "about 0.39 bps, interpolated between the 0 and 3 bps rows"
+    )
+
+
+def test_fee_row_that_cannot_be_read_leaves_the_fee_rows_unread() -> None:
+    # A list with a row missing could hide where the Sharpe changes
+    # sign, so there is no list then, and the row is named.
+    row = "3.0 bps      -0.97  [-2.41, +0.65] (includes 0)"
+    text = _edit(_report(REJECT_REPORT), row, row.replace("-0.97", "  n/a"))
+    summary = parse_audit_report(text)
+    assert summary.fee_sharpes is None and summary.sharpe_5bps == -1.53
+    assert summary.problems == [
+        "unparseable: Sharpe by fee in '3.0 bps        n/a  [-2.41, "
+        "+0.65] (includes 0)      0.003   -15.60%   -56.92%    0.0522'"
+    ]
+    assert "Sharpe by fee" not in _rows(audit_table(summary))
 
 
 # --- robustness: a format that changes, output that is cut ------------
@@ -852,7 +1148,8 @@ def test_fee_table_is_read_by_its_header() -> None:
     header = "  DSR(N=10)"
     row = "-1.53  [-3.00, +0.07] (includes 0)      0.000"
     text = _edit(_report(REJECT_REPORT), header, "")
-    text = _edit(text, row, row.removesuffix("      0.000"))
+    text, rows = re.subn(r" +\d\.\d{3}(?= +[-+][\d.]+%)", "", text)
+    assert rows == 5
     assert _parsed(text) == _expected(REJECT_REPORT)
     # A cell without a column name is not given one.
     text = _edit(_report(REJECT_REPORT), row, row + "      0.111")
@@ -914,6 +1211,29 @@ def test_verdict_and_rows_that_disagree_get_a_note() -> None:
     ) in _table(rejected)
 
 
+def test_lag_row_states_the_rule_for_a_sharpe_not_above_zero() -> None:
+    # "pass" next to -1.53 is the audit's rule, not a slip: with a 1-bar
+    # Sharpe at or below 0, the 2-bar Sharpe may be up to 0.5 lower.
+    rule = (
+        "; with a 1-bar Sharpe at or below 0 the test passes if the 2-bar "
+        "Sharpe is no more than 0.5 lower"
+    )
+    rows = _rows(_table(_report("baseline_flow_v1.3.2.txt")))
+    assert rows["Lag test"] == [
+        "pass", "2-bar lag Sharpe -1.53, 1-bar -1.53" + rule
+    ]
+    rows = _rows(_table(_report("leaky_example_v1.3.1.txt")))
+    assert rows["Lag test"] == [
+        "**FAIL**", "2-bar lag Sharpe -10.33, 1-bar -9.21" + rule
+    ]
+    # Above 0 the rule is the plain one (2-bar Sharpe above 0), and a
+    # 1-bar Sharpe printed as +0.00 does not say which rule applied.
+    rows = _rows(_table(_report(PASS_REPORT)))
+    assert rows["Lag test"] == ["pass", "2-bar lag Sharpe +1.64, 1-bar +1.45"]
+    rows = _rows(_table(_report("forging_example_v1.3.2.txt")))
+    assert rows["Lag test"][1] == "2-bar lag Sharpe +0.00, 1-bar +0.00"
+
+
 def test_data_quality_gets_a_row_only_below_the_gate() -> None:
     assert "Data quality" not in _rows(_table(_report(PASS_REPORT)))
     # A REJECT for the data alone: the row says why, so no note.
@@ -924,7 +1244,7 @@ def test_data_quality_gets_a_row_only_below_the_gate() -> None:
     ]
     assert rows.pop("Verdict")[0] == "**REJECT**"
     assert rows.pop("Data") == ["", "panel `2307dc25d97bd97a`"]
-    assert {result for result, _ in rows.values()} == {"pass"}
+    assert {result for result, _ in rows.values() if result} == {"pass"}
     assert "The verdict is" not in table
 
 
@@ -1108,6 +1428,94 @@ def test_live_audit_that_stops_names_its_data(
         "",
         f"- `no audit report in the text, which starts with {error!r}`",
     ]
+
+
+def _momentum(df: pd.DataFrame) -> pd.Series:
+    """Cross-sectional 24 h momentum: causal, and it trades."""
+    past = df.groupby("symbol")["close"].pct_change(24).fillna(0.0)
+    return past - past.groupby(df["timestamp"]).transform("mean")
+
+
+@pytest.fixture(scope="module")
+def live_audit() -> tuple[dict, dict]:
+    """Result and provenance of the audit of this checkout.
+
+    In-process, on a small synthetic panel whose last two days are the
+    holdout, with every seed fixed: nothing is read from disk and no
+    process is started, so it is the same on every machine.
+    """
+    symbols = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+               "ADAUSDT")
+    panel = generate_calibrated_panel(symbols=symbols, n_hours=720, seed=7)
+    cut = panel["timestamp"].max() - 47 * HOUR
+    result = run_full_audit(
+        panel.loc[panel["timestamp"] < cut].reset_index(drop=True),
+        _momentum,
+        holdout_df=panel.loc[panel["timestamp"] >= cut],
+        causality_seed=7,
+    )
+    provenance = {
+        "commit": "abc1234", "strategy_sha256": "0" * 16,
+        "data_sha256": "1" * 16, "holdout_sha256": "2" * 16,
+        "causality_seed": 7, "n_random_cuts": 8,
+        "isolation": "host process",
+    }
+    return result, provenance
+
+
+def test_report_of_the_current_audit_is_read_back(
+    live_audit: tuple[dict, dict],
+) -> None:
+    # The saved reports are snapshots. This is the report the audit of
+    # this checkout prints: every value the parser reads from it has to
+    # be the value the audit printed, so a report line that changes
+    # fails here instead of showing as "?" in the CI tables.
+    result, provenance = live_audit
+    assert result["holdout_eval"]["status"] == "ok"
+    report = format_audit_report(result, "momentum.py", provenance)
+    summary = parse_audit_report(report + "\n")
+
+    def printed(value: float, digits: int = 2) -> float:
+        return float(f"{value:.{digits}f}")
+
+    def interval(metrics: object) -> tuple[float, float]:
+        low, high = metrics.sharpe_ci_low, metrics.sharpe_ci_high
+        if math.isnan(low):
+            return (math.nan, math.nan)
+        return (printed(low), printed(high))
+
+    fee, oos = result["fee_curve"][5.0], result["split"]["OOS"]
+    holdout = result["holdout"]
+    lag, null = result["lag_sensitivity"], result["shuffled_null"]
+    wick = result["wick_integrity"]
+    assert fee.mean_turnover > 0.01  # the strategy trades
+    expected = dict(
+        strategy="momentum.py", version=AUDIT_VERSION, commit="abc1234",
+        strategy_sha256="0" * 16, data_sha256="1" * 16,
+        holdout_sha256="2" * 16,
+        verdict="PASS" if result["passed"] else "REJECT",
+        causality_passed=result["causality"]["passed"],
+        causality_detail=result["causality"]["detail"],
+        dqs=result["data_quality"].dqs,
+        sharpe_5bps=printed(fee.sharpe), sharpe_5bps_ci=interval(fee),
+        turnover_5bps=printed(fee.mean_turnover, 4),
+        oos_sharpe=printed(oos.sharpe), oos_sharpe_ci=interval(oos),
+        lag1_sharpe=printed(lag["sr_lag1"]),
+        lag2_sharpe=printed(lag["sr_lag2"]), lag_passed=lag["passed"],
+        null_mean=printed(null["null_sharpe"]),
+        null_sd=printed(null["null_sd"]), null_passed=null["passed"],
+        wick_share_pct=printed(wick["wick_pnl_share"] * 100, 1),
+        wick_passed=wick["passed"], holdout_passed=True,
+        holdout_sharpe=printed(holdout.sharpe),
+        holdout_sharpe_ci=interval(holdout),
+        holdout_detail="bar-by-bar evaluation",
+    )
+    read = summary.as_dict()
+    # A new audit version is named by the parser until it is added to
+    # CHECKED_VERSIONS; that note is about the version, not the format.
+    notes = [p for p in read.pop("problems") if "checked against" not in p]
+    assert notes == []
+    assert _plain(read) == _plain({**read, **expected})
 
 
 def test_command_line_with_data_files(
