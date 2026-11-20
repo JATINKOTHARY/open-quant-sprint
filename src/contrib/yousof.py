@@ -12,7 +12,19 @@ From Issue #1: the same symbols, columns and dtypes as the panel;
 every symbol starting exactly one hour after it ends in the panel,
 with no overlapping keys and no gaps; with ``as_of``, only bars that
 had closed at download time; and, as a warning, funding outside
-00:00/08:00/16:00 UTC.
+00:00/08:00/16:00 UTC. ``python -m src.contrib.yousof --continuation
+PREV NEW`` runs the check on two files.
+
+Missing hours are warnings. A gap on the exchange's side is still
+there after a second download, and the run then goes ahead on the bars
+that exist, with the gap listed in the report. So an hour without a
+bar is a warning that names the symbol and the hours, wherever it is:
+at the start of a symbol, in between or at its end. Every missing
+hour is named, hours in a row as one period. The builder fills
+a gap of up to three hours with bars of zero volume and drops the
+hours after that, so such bars are named as well. One case stays an
+error: a file that starts late as a whole, because the audit stops on
+it.
 
 Why the start is checked per symbol. ``holdout_start_problem`` in
 ``src.audit`` compares the first timestamp of the whole file with the
@@ -29,7 +41,15 @@ Checks beyond the Issue, and what each is for:
   a missing hour, so it would count as a bar of its own.
 - A symbol that ends before or after the others. A download cut short
   for one symbol leaves no gap inside the file, only a shorter tail,
-  and the last hours then lack that symbol in the cross-section.
+  and the last hours then lack that symbol in the cross-section: its
+  missing hours are named. Bars after the others end are an error.
+  Without ``end`` the end of the file is the last bar most symbols
+  have, so a file cut short for every symbol, or for most of them,
+  cannot be told from a complete one. With ``end`` (``--end``) it is
+  given: bars after it are an error and the hours a symbol lacks
+  before it are warnings, however many symbols are short.
+- Bars with zero volume, as a warning. The train panel has none, so
+  in a new file they are bars the builder filled in.
 - Funding that is zero at every settlement hour of a symbol, as a
   warning. ``data/build_dataset.py`` writes 0 when the funding
   download comes back empty, so a failed download reads as free
@@ -89,6 +109,10 @@ disagree, PASS with a failed row or REJECT without one, a note under
 the table says so: the audit then gates on something the table does
 not show, or its format changed. Data quality gets a row only below
 the audit's gate; on the official panel it is the same for everyone.
+The lag test has a second rule: with a 1-bar Sharpe at or below 0 it
+passes if the 2-bar Sharpe is no more than 0.5 lower. The row states
+that rule then, since "pass" next to a negative Sharpe is easy to
+misread.
 
 Which data. With many data files, a reviewer needs to know which one a
 run used, above all when it failed. The report prints the first 16 hex
@@ -102,6 +126,16 @@ its error line names no file. So the caller can name the files
 ``audit_table``): the table then shows path and hash, says when a
 report was made on other data than the file given, and for a stopped
 audit says which files it was run with.
+
+Rows without a result. The signal tracks ask each write-up for the fee
+rows, the break-even fee, the split of PnL into price, fees and
+funding, and the correlation with ``baseline_flow.py``; the review
+flags of block [13] are read by hand for every strategy. The table
+shows them below the checks, read from blocks [5], [9], [12] and [13].
+The report prints no break-even fee: it is interpolated on a straight
+line between the two flat fee rows where the printed Sharpe changes
+sign, "> 10 bps" or "< 0 bps" when it does not, and the row says so.
+None of these rows is part of the verdict.
 
 Text a strategy chose. The causality and holdout lines can hold a
 strategy's error message. Since audit 1.3.2 it is one escaped line
@@ -146,19 +180,36 @@ def check_continuation(
     prev: pd.DataFrame,
     new: pd.DataFrame,
     as_of: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
 ) -> list[str]:
     """List what keeps ``new`` from cleanly continuing ``prev``.
 
     One readable line per problem. A line starts with "error:" when the
     file must not be evaluated as it is, and with "warning:" when it
     needs a look but can be legitimate (Binance can move a symbol to
-    another funding interval). Errors come first. An empty list means
-    OK.
+    another funding interval; an hour can be missing on the exchange's
+    side). Errors come first. An empty list means OK.
 
     ``as_of`` is the download time; without a time zone it is read as
     UTC. With it, bars that had not closed by then are reported.
+
+    ``end`` is the open time of the last bar ``new`` should have, read
+    the same way. With it, bars after ``end`` are an error and the
+    hours a symbol lacks up to ``end`` are warnings. Without it the end
+    is the last bar most symbols have.
     """
     errors, frames = _prepare(prev, new)
+    if end is not None:
+        try:
+            end = _utc(end)
+        except (ValueError, TypeError):
+            end = pd.NaT
+        if pd.isna(end):
+            errors.append(
+                "end is not a time, so the end of new was compared with "
+                "the other symbols instead"
+            )
+            end = None
     warnings: list[str] = []
     if frames is not None:
         prev, new = frames
@@ -166,7 +217,9 @@ def check_continuation(
         on_grid = new.loc[~off_grid]
         errors += _symbol_errors(prev, new)
         errors += _key_errors(prev, new, off_grid)
-        errors += _seam_errors(prev, on_grid)
+        seam_errors, gaps = _seam_problems(prev, on_grid, end)
+        errors += seam_errors
+        warnings += gaps
         warnings += _seam_jump_warnings(prev, on_grid)
         if as_of is not None:
             errors += _unclosed_errors(new, as_of)
@@ -188,6 +241,23 @@ def _hours(stamps: pd.Series | pd.DatetimeIndex) -> str:
     shown = ", ".join(_fmt(ts) for ts in stamps[:MAX_EXAMPLES])
     more = len(stamps) - MAX_EXAMPLES
     return shown + (f" (+{more} more)" if more > 0 else "")
+
+
+def _periods(stamps: pd.DatetimeIndex) -> str:
+    """Every hour of ``stamps``, hours in a row as "from A to B".
+
+    Not cut like ``_hours``: the report of a run lists a gap in full.
+    """
+    runs: list[list[pd.Timestamp]] = []
+    for ts in pd.DatetimeIndex(stamps).unique().sort_values():
+        if runs and ts - runs[-1][1] == HOUR:
+            runs[-1][1] = ts
+        else:
+            runs.append([ts, ts])
+    return ", ".join(
+        f"at {_fmt(a)}" if a == b else f"from {_fmt(a)} to {_fmt(b)}"
+        for a, b in runs
+    )
 
 
 def _by_symbol(rows: pd.DataFrame) -> str:
@@ -328,51 +398,73 @@ def _key_errors(
     return errors
 
 
-def _seam_errors(prev: pd.DataFrame, on_grid: pd.DataFrame) -> list[str]:
-    """Per symbol: where ``new`` starts and ends, and missing hours.
+def _seam_problems(
+    prev: pd.DataFrame,
+    on_grid: pd.DataFrame,
+    end: pd.Timestamp | None = None,
+) -> tuple[list[str], list[str]]:
+    """Where ``new`` starts and ends, and the hours it lacks.
 
-    A symbol has to start one hour after it ends in ``prev``, end with
-    the other symbols and have every hour in between. Symbols with the
+    Errors: the file does not start one hour after ``prev`` ends, which
+    the audit stops on, or a symbol has bars after the others end (after
+    ``end`` when it is given). Warnings: the hours a symbol lacks
+    between its last bar in ``prev`` and that end. A symbol cut short
+    at the end of ``prev`` is a warning too: the audit compares the
+    start of the file with the end of the whole panel. Symbols with the
     same problem share one line, so an hour missing across the panel is
     one line, not 20.
     """
     if on_grid.empty:
-        return []
+        return [], []
     prev_end = prev.groupby("symbol")["timestamp"].max()
     stamps = on_grid.drop_duplicates(KEYS).groupby("symbol")["timestamp"]
     starts, ends = stamps.min(), stamps.max()
     # On a tie the later end is the reference: a file cut short must
-    # not make the complete symbols look wrong.
-    common_end = ends.mode().max()
+    # not make the complete symbols look wrong. A given end replaces it.
+    common_end = ends.mode().max() if end is None else end
     checked = sorted(set(starts.index) & set(prev_end.index))
-    found: dict[str, list[str]] = {}
+    if not checked:
+        return [], []
+    expected = prev_end[checked] + HOUR
+    file_start = starts[checked].min()
+    # The audit's check: the file starts one hour after the panel ends.
+    file_expected = prev_end.max() + HOUR
+    late_file = file_start > file_expected
+    wrong: dict[str, list[str]] = {}
+    lacking: dict[str, list[str]] = {}
     for sym in checked:
-        start, end = starts[sym], ends[sym]
-        expected = prev_end[sym] + HOUR
-        if start != expected:
+        if starts[sym] == file_start != file_expected:
             msg = (
-                f"new starts at {_fmt(start)} UTC, expected "
-                f"{_fmt(expected)}, one hour after prev ends"
+                f"new starts at {_fmt(file_start)} UTC, expected "
+                f"{_fmt(file_expected)}, one hour after prev ends"
             )
-            found.setdefault(msg, []).append(sym)
-        if end != common_end:
+            wrong.setdefault(msg, []).append(sym)
+        if ends[sym] > common_end:
             msg = (
-                f"new ends at {_fmt(end)} UTC, most symbols end at "
+                f"new ends at {_fmt(ends[sym])} UTC, most symbols end at "
                 f"{_fmt(common_end)}"
+                if end is None
+                else f"new ends at {_fmt(ends[sym])} UTC, after the "
+                f"expected end {_fmt(end)}"
             )
-            found.setdefault(msg, []).append(sym)
-        grid = pd.date_range(start, end, freq="h")
+            wrong.setdefault(msg, []).append(sym)
+        # Hours before a late start of the whole file are that error.
+        first = max(expected[sym], file_start) if late_file else expected[sym]
+        grid = pd.date_range(first, common_end, freq="h")
         gaps = grid.difference(pd.DatetimeIndex(stamps.get_group(sym)))
         if not gaps.empty:
-            msg = f"no bar at {_hours(gaps)} UTC ({len(gaps)} missing)"
-            found.setdefault(msg, []).append(sym)
+            msg = f"no bar {_periods(gaps)} UTC ({len(gaps)} missing)"
+            lacking.setdefault(msg, []).append(sym)
 
-    errors = []
-    for msg, syms in found.items():
-        everyone = len(syms) == len(checked) > 1
-        who = f"all {len(syms)} symbols" if everyone else ", ".join(syms)
-        errors.append(f"{who}: {msg}")
-    return errors
+    def lines(found: dict[str, list[str]]) -> list[str]:
+        out = []
+        for msg, syms in found.items():
+            everyone = len(syms) == len(checked) > 1
+            who = f"all {len(syms)} symbols" if everyone else ", ".join(syms)
+            out.append(f"{who}: {msg}")
+        return out
+
+    return lines(wrong), lines(lacking)
 
 
 def _seam_jump_warnings(
@@ -422,22 +514,31 @@ def _unclosed_errors(new: pd.DataFrame, as_of: pd.Timestamp) -> list[str]:
 
 
 def _volume_warnings(on_grid: pd.DataFrame) -> list[str]:
-    """Symbols with zero volume in every bar of ``new``.
+    """Bars with zero volume, and symbols with nothing else.
 
     Zero volume is valid OHLC, so neither the errors here nor
-    ``audit_dataset`` catch it; over a whole file it more likely means
-    a failed download than a quiet market.
+    ``audit_dataset`` catch it. Over a whole file it more likely means
+    a failed download than a quiet market. A few such bars are what
+    the builder writes into a gap of up to three hours: the last close
+    carried forward, with no trade behind it.
     """
     traded = on_grid["volume"] > 0
     counts = traded.groupby(on_grid["symbol"]).agg(["any", "size"])
     quiet = ~counts["any"] & (counts["size"] >= SILENT_VOLUME_MIN)
     silent = sorted(counts.index[quiet])
-    if not silent:
-        return []
-    return [
-        f"volume is zero in every bar for {', '.join(silent)}; did the "
-        "download fail?"
-    ]
+    warnings = []
+    filled = on_grid.loc[~traded & ~on_grid["symbol"].isin(silent)]
+    if not filled.empty:
+        warnings.append(
+            f"{len(filled)} bars in new have zero volume, as when the "
+            f"builder fills a short gap: {_by_symbol(filled)}"
+        )
+    if silent:
+        warnings.append(
+            f"volume is zero in every bar for {', '.join(silent)}; did "
+            "the download fail?"
+        )
+    return warnings
 
 
 def _quality_errors(new: pd.DataFrame) -> list[str]:
@@ -501,6 +602,7 @@ def _funding_warnings(on_grid: pd.DataFrame) -> list[str]:
 CHECKED_VERSIONS = ("1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.3.1", "1.3.2")
 ONE_LINE_ERRORS = (1, 3, 2)  # audit version that prints errors on one line
 TURNOVER_MIN = 1e-5  # the audit's turnover gate at 5 bps
+LAG_SLACK = 0.5  # the audit's lag rule for a 1-bar Sharpe not above 0
 DETAIL_MAX = 160  # characters of free text shown in the table
 NOTE_MAX = 400  # characters of a parser note below it
 HASH_LEN = 16  # hex digits of a file's SHA-256 that the audit prints
@@ -518,6 +620,8 @@ _HEX = r"[0-9a-f]{8,64}"
 _NUM = r"[+-]?(?:\d+(?:\.\d+)?|nan|inf)"
 _CI = rf"\[{_NUM}, {_NUM}\]"
 _TAG = r"\[(PASS|FAIL)\b[^\]]*\]"
+_FEE_LABEL = r"^\s*(\d+(?:\.\d+)? bps|tiered ~\S+)\s"
+_FEE_CELL = rf"{_CI}(?: \(includes 0\))?|n/a|{_NUM}%?"
 
 Interval = tuple[float, float]
 Row = tuple[str, bool | None, str]  # label, result, value
@@ -538,6 +642,13 @@ class AuditSummary:
     The ``*_sha256`` values are the first 16 hex digits of the SHA-256
     of the strategy file, the ``--data`` panel and the ``--holdout``
     file, as the audit prints them (since 1.0.0).
+
+    ``fee_sharpes`` is the Sharpe of every row of the fee table, by
+    the row's label ("0.0 bps", ..., "tiered ~7.7"). The ``*_pct``
+    values are the cumulative PnL parts of block [9] at 5 bps, in
+    percent; a positive funding drag is a cost. ``baseline_corr`` and
+    ``review_flags`` are blocks [12] and [13], which not every report
+    has; the flags are "none" when the block lists none.
     """
 
     strategy: str | None = None
@@ -567,6 +678,13 @@ class AuditSummary:
     holdout_sharpe: float | None = None
     holdout_sharpe_ci: Interval | None = None
     holdout_detail: str | None = None
+    fee_sharpes: list[tuple[str, float]] | None = None
+    gross_pnl_pct: float | None = None
+    fee_cost_pct: float | None = None
+    funding_drag_pct: float | None = None
+    net_pnl_pct: float | None = None
+    baseline_corr: float | None = None
+    review_flags: str | None = None
     problems: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -647,6 +765,8 @@ def parse_audit_report(text: str) -> AuditSummary:
     _read_checks(lines, summary)
     _read_fee_row(lines, summary)
     _read_split(lines, summary)
+    _read_fee_rows(lines, summary)
+    _read_more(lines, summary)
     if lines.withheld_hits:
         summary.problems.append(
             "not read, as they come below a strategy's error message, "
@@ -715,6 +835,8 @@ class _Lines:
         ``label`` is how the anchor reads in the report. With ``last``,
         the last matching line of the whole report, including withheld
         lines: anything a strategy wrote comes before the last line.
+        Without ``required``, a report that has no such line is no
+        problem; a withheld one is named either way.
         """
         if last:
             for line in reversed(self.lines + self.withheld):
@@ -724,7 +846,7 @@ class _Lines:
             for line in self.lines:
                 if re.search(anchor, line):
                     return line
-        if required and any(re.search(anchor, ln) for ln in self.withheld):
+        if any(re.search(anchor, ln) for ln in self.withheld):
             self.withheld_hits.append(what)
         elif required:
             self.problems.append(f"missing: {what} (no {label!r} line)")
@@ -877,8 +999,7 @@ def _read_fee_row(lines: _Lines, s: AuditSummary) -> None:
         return
     names = re.split(r"\s{2,}", header.strip())[1:]
     rest = re.sub(r"^\s*5\.0 bps", "", row)
-    cell = rf"{_CI}(?: \(includes 0\))?|n/a|{_NUM}%?"
-    cells = [found[0] for found in re.finditer(cell, rest)]
+    cells = re.findall(_FEE_CELL, rest)
     if len(cells) != len(names):
         lines.problems.append(
             f"unparseable: 5 bps row, {len(cells)} values under "
@@ -937,6 +1058,68 @@ def _read_split(lines: _Lines, s: AuditSummary) -> None:
         s.holdout_detail = last if "=" not in last else None
 
 
+def _read_fee_rows(lines: _Lines, s: AuditSummary) -> None:
+    """The Sharpe of every row of the fee table, by the row's label.
+
+    Read by the header, like the 5 bps row. The list is kept only when
+    the table is whole: a row that cannot be read, or a table that
+    breaks off, could hide where the Sharpe changes sign.
+    """
+    header = lines.find_optional(r"^\s*Fee \(bps\)")
+    if header is None:
+        return  # named by _read_fee_row
+    names = re.split(r"\s{2,}", header.strip())[1:]
+    rows: list[tuple[str, float]] = []
+    for row in lines.lines[lines.lines.index(header) + 1:]:
+        label = re.match(_FEE_LABEL, row)
+        if label is None:
+            if not row.strip():
+                return  # cut off in the indent of the next row
+            break
+        if label[1] == "5.0 bps":
+            if s.sharpe_5bps is None:
+                return  # named by _read_fee_row
+            rows.append((label[1], s.sharpe_5bps))
+            continue
+        cells = re.findall(_FEE_CELL, row[label.end():])
+        sharpe = dict(zip(names, cells)).get("Sharpe", "")
+        if len(cells) != len(names) or not re.fullmatch(_NUM, sharpe):
+            lines.unparseable("Sharpe by fee", row)
+            return
+        rows.append((label[1], float(sharpe)))
+    else:
+        return  # no line below the table: the report breaks off here
+    s.fee_sharpes = rows or None
+
+
+def _read_more(lines: _Lines, s: AuditSummary) -> None:
+    """The PnL parts of block [9], and blocks [12] and [13] if there."""
+
+    def pnl(what: str, label: str) -> float | None:
+        line = lines.find(what, label, rf"^\s*{label}\s*:")
+        return lines.number(what, line, rf":\s*({_NUM})%")
+
+    s.gross_pnl_pct = pnl("PnL breakdown", "Gross PnL")
+    if s.gross_pnl_pct is not None:  # else the block is named once
+        s.fee_cost_pct = pnl("fee cost", "Fee Cost")
+        s.funding_drag_pct = pnl("funding drag", "Funding Drag")
+        s.net_pnl_pct = pnl("net PnL", "Net PnL")
+
+    # Block [12] is not printed for baseline_flow.py itself or after a
+    # crash, and neither block before audit 1.0.0.
+    what = "correlation with baseline"
+    anchor = r"^\s*(?:\[\d+\]\s*)?CORRELATION\s*:"
+    line = lines.find(what, "CORRELATION", anchor, required=False)
+    s.baseline_corr = lines.number(what, line, rf"=\s*({_NUM})\s*$")
+
+    what = "review flags"
+    anchor = r"^\s*(?:\[\d+\]\s*)?REVIEW FLAGS\s*:"
+    line = lines.find(what, "REVIEW FLAGS", anchor, required=False)
+    found = lines.match(what, line, r":\s*(.*?)\s*\(manual review\b")
+    if found:
+        s.review_flags = found[1]
+
+
 def audit_table(
     summary: AuditSummary,
     name: str | None = None,
@@ -981,6 +1164,7 @@ def audit_table(
         f"| {label} | {results[passed]} | {_cell(value)} |"
         for label, passed, value in rows
     ]
+    out += [f"| {label} | | {_cell(value)} |" for label, value in _more(s)]
     notes = data_notes + _notes(s, rows)
     if notes:
         out += [""] + notes
@@ -1064,6 +1248,13 @@ def _rows(s: AuditSummary) -> list[Row]:
         lag = f"2-bar lag Sharpe {s.lag2_sharpe:+.2f}"
         if s.lag1_sharpe is not None:
             lag += f", 1-bar {s.lag1_sharpe:+.2f}"
+        if _above(s.lag1_sharpe, 0.0, 0.01) is False:
+            # evaluate_lag_sensitivity in src/audit.py; a 1-bar Sharpe
+            # printed as +0.00 does not say which rule applied.
+            lag += (
+                "; with a 1-bar Sharpe at or below 0 the test passes if "
+                f"the 2-bar Sharpe is no more than {LAG_SLACK:g} lower"
+            )
     null = unread
     if s.null_mean is not None:
         null = f"mean Sharpe {s.null_mean:+.2f}"
@@ -1096,6 +1287,78 @@ def _rows(s: AuditSummary) -> list[Row]:
         dqs = f"DQS {s.dqs:g}/100 (needs >= {DQS_MIN:g})"
         rows.append(("Data quality", False, dqs))
     return rows
+
+
+def _more(s: AuditSummary) -> list[tuple[str, str]]:
+    """(label, value) of the rows without a result, below the checks.
+
+    What the signal tracks ask of a write-up, and the review flags. A
+    run that did not trade, as after a crash, prints zeros there, so
+    it gets no fee or PnL rows.
+    """
+    rows = []
+    traded = s.turnover_5bps is None or s.turnover_5bps > 0
+    if s.fee_sharpes and traded:
+        cells = []
+        for label, sharpe in s.fee_sharpes:
+            fee = _flat_fee(label)
+            name = label if fee is None else f"{fee:g}"
+            cells.append(f"{name} bps {sharpe:+.2f}")
+        rows.append(("Sharpe by fee", ", ".join(cells)))
+        even = _break_even(s.fee_sharpes)
+        if even:
+            rows.append(("Break-even fee", even))
+    if s.gross_pnl_pct is not None and traded:
+        parts = (
+            ("gross", s.gross_pnl_pct),
+            ("fee cost", s.fee_cost_pct),
+            ("funding drag", s.funding_drag_pct),
+            ("net", s.net_pnl_pct),
+        )
+        pnl = [f"{name} {x:+.2f}%" for name, x in parts if x is not None]
+        rows.append(("PnL @ 5 bps", ", ".join(pnl)))
+    if s.baseline_corr is not None:
+        corr = f"{s.baseline_corr:+.2f}, hourly net returns at 5 bps"
+        rows.append(("Correlation with baseline", corr))
+    if s.review_flags and s.review_flags != "none":
+        flags = _code(s.review_flags)
+        flags += " (manual review, not part of the verdict)"
+        rows.append(("Review flags", flags))
+    return rows
+
+
+def _flat_fee(label: str) -> float | None:
+    """The fee of a flat fee row in bps; None for the tiered row."""
+    found = re.fullmatch(r"(\d+(?:\.\d+)?) bps", label)
+    return float(found[1]) if found else None
+
+
+def _break_even(fee_sharpes: list[tuple[str, float]]) -> str:
+    """The fee at which the Sharpe crosses zero, from the flat rows.
+
+    The report prints no such value. It is interpolated on a straight
+    line between the two rows where the printed Sharpe changes sign: a
+    first look, not a result of the audit. "" when the rows do not say.
+    """
+    flat = sorted(
+        (fee, sharpe)
+        for label, sharpe in fee_sharpes
+        if (fee := _flat_fee(label)) is not None
+    )
+    if len(flat) < 2 or any(math.isnan(sharpe) for _, sharpe in flat):
+        return ""
+    lowest, highest = flat[0][0], flat[-1][0]
+    if flat[0][1] <= 0:
+        return f"< {lowest:g} bps (Sharpe not above 0 at {lowest:g} bps)"
+    for (fee, sharpe), (next_fee, next_sharpe) in zip(flat, flat[1:]):
+        if next_sharpe <= 0:
+            share = sharpe / (sharpe - next_sharpe)
+            even = fee + (next_fee - fee) * share
+            return (
+                f"about {even:.2f} bps, interpolated between the "
+                f"{fee:g} and {next_fee:g} bps rows"
+            )
+    return f"> {highest:g} bps (Sharpe above 0 in every fee row)"
 
 
 def _notes(s: AuditSummary, rows: list[Row]) -> list[str]:
@@ -1157,6 +1420,28 @@ def _cell(text: str) -> str:
     return text.replace("|", "\\|")
 
 
+def _check_files(
+    prev: str, new: str, as_of: str | None = None, end: str | None = None
+) -> int:
+    """Print what ``check_continuation`` finds for two data files.
+
+    The first lines name the files with the hash the audit prints for
+    them, so the output says which data was checked.
+    """
+    frames = []
+    for path in (prev, new):
+        try:
+            frames.append(pd.read_parquet(path))
+        except (OSError, ValueError) as exc:
+            print(f"Could not read {path}: {exc}")
+            return 2
+    print(f"prev: {prev} (sha256 {file_hash(prev)})")
+    print(f"new: {new} (sha256 {file_hash(new)})")
+    problems = check_continuation(*frames, as_of=as_of, end=end)
+    print("\n".join(problems) if problems else "no problems")
+    return 1 if any(line.startswith("error:") for line in problems) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """``python -m src.contrib.yousof [options] [REPORT ...]``.
 
@@ -1165,6 +1450,12 @@ def main(argv: list[str] | None = None) -> int:
     ``--data`` and ``--holdout`` name the files the audit ran on; see
     ``audit_table``. Returns 1 when a file cannot be read, else 0,
     whatever the verdict.
+
+    ``--continuation PREV NEW`` runs ``check_continuation`` on two
+    data files instead and prints what it finds, ``--as-of`` being the
+    download time of NEW and ``--end`` the open time of its last bar.
+    It returns 1 on an error, 2 when a file cannot be read, else 0;
+    warnings alone are 0.
     """
     parser = argparse.ArgumentParser(
         prog="python -m src.contrib.yousof",
@@ -1173,7 +1464,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("reports", nargs="*", metavar="REPORT")
     parser.add_argument("--data", help="the --data panel of the runs")
     parser.add_argument("--holdout", help="the --holdout file of the runs")
+    parser.add_argument(
+        "--continuation", nargs=2, metavar=("PREV", "NEW"),
+        help="check that the data file NEW continues PREV; no REPORT",
+    )
+    parser.add_argument(
+        "--as-of", metavar="TIME",
+        help="with --continuation: when NEW was downloaded (UTC)",
+    )
+    parser.add_argument(
+        "--end", metavar="TIME",
+        help="with --continuation: open time of the last bar NEW should "
+        "have (UTC)",
+    )
     args = parser.parse_args(argv)
+    if args.continuation:
+        if args.reports or args.data or args.holdout:
+            parser.error("--continuation takes only --as-of and --end")
+        return _check_files(
+            *args.continuation, as_of=args.as_of, end=args.end
+        )
+    if args.as_of or args.end:
+        parser.error("--as-of and --end need --continuation")
     paths = args.reports
     texts: list[tuple[str | None, str]] = []
     blocks: list[str] = []

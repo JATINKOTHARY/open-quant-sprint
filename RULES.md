@@ -1,4 +1,4 @@
-# Sprint 01 Rules (v1.8)
+# Sprint 01 Rules (v1.11)
 
 Changes to these rules are listed in `CHANGELOG.md`.
 
@@ -56,6 +56,13 @@ is an equally valid research result.
 The audit catches common look-ahead mistakes. It is not secure against a participant who sets out to
 fool it; the rules rely on good faith. Known gaps are listed in [`LIMITATIONS.md`](LIMITATIONS.md).
 
+## Extra strategies
+
+A participant may open one strategy PR outside their track, by Nov 20. It is reviewed after the track
+PRs and merged before the code freeze once the participant's own Part 1 is merged and Part 2 is open.
+If its hypothesis and settings were not posted in a draft PR before the first run on the full training
+panel, it is reported as exploratory, and its write-up states roughly how many variants were tried.
+
 ## Official verdict
 
 CI is a convenience for contributors, not the referee. The official verdict on every strategy is the
@@ -92,26 +99,55 @@ The audit takes a panel (`--data`) and the period that follows it (`--holdout`),
 error if the period does not start exactly one hour after the panel ends.
 
 Nov 22, holdout: `--data data/train_1h.parquet --holdout data/holdout_1h.parquet`. The two files are
-contiguous already.
+contiguous already. The continuation check of step 2 below runs on them as well, with
+`--end 2026-10-18T14:00`, and its output is published with the log.
 
 Dec 7, forward:
 
 1. After 00:00 UTC on Dec 7, build the panel up to the start of the period, and the period itself.
-   The builder drops bars that have not closed yet.
+   The builder drops bars that have not closed yet. Note the time of the download (UTC).
    ```
    python -m data.build_dataset --start 2025-01-01T00:00 --end 2026-11-22T00:00 --holdout-frac 0 --out-dir data/forward/panel
    python -m data.build_dataset --start 2026-11-22T00:00 --end 2026-12-07T00:00 --holdout-frac 0 --out-dir data/forward/period
    ```
-   The period file has to end at 23:00 on Dec 6 and pass the data quality check. Record its SHA-256.
-2. Switch the network off and run `python -m src.freeze check`.
-3. For each strategy, once its file has been read:
+2. Check that the period continues the panel, and list the first bar, the last bar and the number of
+   bars of every symbol in both files:
+   ```
+   python -m src.contrib.yousof --continuation data/forward/panel/panel_1h.parquet data/forward/period/panel_1h.parquet --as-of <download time> --end 2026-12-06T23:00 > data/forward/continuation.txt
+   python -c "import sys, pandas as pd; [print(f, pd.read_parquet(f).groupby('symbol')['timestamp'].agg(['min', 'max', 'count']), sep='\n') for f in sys.argv[1:]]" data/forward/panel/panel_1h.parquet data/forward/period/panel_1h.parquet > data/forward/bars.txt
+   ```
+   Expected: every symbol from 00:00 on Jan 1, 2025 to 23:00 on Nov 21, 2026 in the panel (16,560
+   bars), and from 00:00 on Nov 22 to 23:00 on Dec 6 in the period (360 bars). The check prints
+   `no problems` or one line per problem. A `warning:` line names hours without a bar up to 23:00 on
+   Dec 6, and bars the builder filled in: it fills a gap of up to 3 hours by carrying the close
+   forward, with zero volume and zero funding, and drops the hours of a longer gap. An `error:` line
+   means the period cannot be evaluated as it is; the command then exits with 1, or with 2 if a file
+   cannot be read.
+   - If there is any warning or error, or the list differs from the expected one, build both files
+     again, once, with the same commands plus `--overwrite`, and repeat this step. There is no
+     further download.
+   - Warnings that remain: the run goes ahead on the bars that exist, and the report lists the missing
+     and filled hours. The same holds for a period that ends before 23:00 on Dec 6.
+   - If the period still does not start one hour after the panel ends (an hour missing for every
+     symbol at the seam, or a period file that starts late as a whole), the audit cannot run on it,
+     because it stops on such a seam. The seam then moves: take the first hour after the gap that
+     every symbol has, and build the panel with `--end`, and the period with `--start`, at the hour
+     after it. The missing hours then fall inside the panel, where the builder treats them like any
+     other gap. The forward period is shorter by those hours, and the report says so.
+   - Any other error that remains is published, and the cohort is told what will be done about it
+     before any strategy is run.
+
+   The period file has to pass the data quality check. Record the SHA-256 of both files.
+3. Switch the network off and run `python -m src.freeze check`.
+4. For each strategy, once its file has been read:
    ```
    python -m src.audit strategies/<name>.py --data data/forward/panel/panel_1h.parquet --holdout data/forward/period/panel_1h.parquet --n-random-cuts 60 --log data/forward/log.jsonl
    ```
    The causality and cost checks then run on the longer panel (Jan 2025 - Nov 21, 2026). The forward
    result is the run's record in `log.jsonl` (`verdict`, `holdout_status`, `holdout_sharpe`); the
-   `Holdout` line of the report shows the same result.
-4. Publish the reports, `log.jsonl` and the hashes.
+   `Holdout` line of the report shows the same result. A strategy that fails on a missing hour or on
+   a filled bar is listed as failed, like any other failure in an official run.
+5. Publish the reports, `log.jsonl`, `continuation.txt`, `bars.txt` and the hashes.
 
 ## Holdout and forward period
 
